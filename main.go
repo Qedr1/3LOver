@@ -6,7 +6,6 @@
 // Производительность:
 // - RX: ipv4.PacketConn.ReadBatch → запись в TUN (L3).
 // - TX: чтение из TUN (L3) → отправка UDP: копирующий батч WriteBatch или zerocopy SendmsgN.
-// - UDP_SEGMENT: включается ТОЛЬКО если udpgso_mss > 0 и aggregate_inner = true.
 //
 // Логи недоступности пира: warmup и tx, троттлинг 5с/peer.
 
@@ -17,8 +16,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -45,20 +47,23 @@ import (
 type Config struct {
 	Tun struct {
 		Name       string   `toml:"name"`        // имя TUN; "" → "tun0"
+		Queues     int      `toml:"queues"`      // число очередей TUN; 0 → 1
 		Addr       string   `toml:"addr"`        // IPv4 CIDR для TUN, напр. "10.10.0.1/24"
-		LinkMTU    int      `toml:"link_mtu"`    // MTU интерфейса; 0 → не менять (или взять из mtu)
+		LinkMTU    int      `toml:"link_mtu"`    // MTU интерфейса; 0 → 9000
 		AddRoute   bool     `toml:"add_route"`   // добавить маршрут своей подсети на TUN
 		GrayRoutes []string `toml:"gray_routes"` // доп. IPv4 CIDR, направлять в TUN
 		MTU        int      `toml:"mtu"`         // целевой MTU inner; 0 → 9000
 	} `toml:"tun"`
 	Transport struct {
 		Listen       string `toml:"listen"`          // UDP bind "ip:port"; "" → "0.0.0.0:5555"
+		Listeners    int    `toml:"listeners"`       // число UDP listeners на одном listen; 0 → 1
+		ReusePort    bool   `toml:"reuse_port"`      // включить SO_REUSEPORT для multi-listener bind
 		UDPRcv       int    `toml:"udp_rbuf"`        // запрошенный SO_RCVBUF; 0 → 32MiB
 		UDPSnd       int    `toml:"udp_wbuf"`        // запрошенный SO_SNDBUF; 0 → 32MiB
 		ZeroCopy     bool   `toml:"zerocopy"`        // включить SO_ZEROCOPY
 		ZCMinBytes   int    `toml:"zc_min_bytes"`    // порог для zerocopy; 0 → 8192
-		UDPGSOMSS    int    `toml:"udpgso_mss"`      // MSS для UDP_SEGMENT; 0 → выкл
-		AggregateInn bool   `toml:"aggregate_inner"` // агрегировать несколько inner в один outer UDP
+		UDPGSOMSS    int    `toml:"udpgso_mss"`      // deprecated: игнорируется, сохранено для совместимости конфига
+		AggregateInn bool   `toml:"aggregate_inner"` // deprecated: игнорируется, сохранено для совместимости конфига
 	} `toml:"transport"`
 	Map struct {
 		Path string `toml:"path"` // путь к мэппингу: серый_IP → "белый ip:port"; "" → "conf/peers.toml"
@@ -70,6 +75,9 @@ type Config struct {
 	Log struct {
 		Level string `toml:"level"` // debug|info|warn|error; "" → info
 	} `toml:"log"`
+	Debug struct {
+		PprofListen string `toml:"pprof_listen"` // HTTP pprof bind; "" → disabled
+	} `toml:"debug"`
 }
 
 // peersTOML — формат TOML файла мэппинга пиров.
@@ -77,18 +85,54 @@ type peersTOML struct {
 	Peers map[string]string `toml:"peers"`
 }
 
-// tunDevice — дескриптор TUN (чистый L3, без vnet_hdr).
-// Потокобезопасность: запись делает одна горутина.
+// tunDevice — одна очередь TUN (один fd).
 type tunDevice struct {
 	fd int // файловый дескриптор /dev/net/tun
 }
 
-// peerMap — неизменяемая карта серый_IP→endpoint под atomic.Value.
-type peerMap struct {
-	v atomic.Value // map[uint32]string
+// tunBundle — один TUN интерфейс с одной или несколькими очередями.
+type tunBundle struct {
+	name      string
+	queues    []*tunDevice
+	closeOnce sync.Once
 }
 
-// udpState — UDP-сокет, кэш адресов, фактические размеры сокетных буферов.
+// rxPacket — буфер inner-пакета для передачи от UDP reader к TUN writer.
+type rxPacket struct {
+	buf []byte
+}
+
+// rxIngressStats — счётчики давления на RX очередь и записи в TUN.
+type rxIngressStats struct {
+	enqueued       atomic.Uint64
+	written        atomic.Uint64
+	queueWaits     atomic.Uint64
+	queueHighWater atomic.Uint64
+	tunWriteWaits  atomic.Uint64
+}
+
+// rxIngress — общий bounded queue между UDP readers и одним TUN writer.
+type rxIngress struct {
+	packets chan rxPacket
+	pool    *sync.Pool
+	tun     *tunDevice
+	effMTU  int
+	stats   rxIngressStats
+}
+
+// resolvedEndpoint — нормализованный IPv4 endpoint и готовые адресные формы для отправки.
+type resolvedEndpoint struct {
+	key     string
+	udpAddr *net.UDPAddr
+	sock4   *unix.SockaddrInet4
+}
+
+// peerMap — неизменяемая карта серый_IP→endpoint под atomic.Value.
+type peerMap struct {
+	v atomic.Value // map[uint32]resolvedEndpoint
+}
+
+// udpState — UDP-сокет и служебное состояние для логов/прогрева.
 type udpState struct {
 	conn   *net.UDPConn
 	pc     *ipv4.PacketConn
@@ -96,19 +140,27 @@ type udpState struct {
 	zerocp bool
 	zcMin  int
 
-	udpgsoMSS int  // MSS для UDP_SEGMENT
-	aggInner  bool // агрегировать inner
-
 	rcvSz int // фактический SO_RCVBUF
 	sndSz int // фактический SO_SNDBUF
 
-	mu      sync.RWMutex
-	r4      map[string]*net.UDPAddr
-	rs4     map[string]*unix.SockaddrInet4
+	shared    *udpShared
+	closeOnce sync.Once
+}
+
+// udpShared — общее состояние нескольких reuseport listeners.
+type udpShared struct {
+	logMu   sync.Mutex
 	lastLog map[string]time.Time
 
 	logCool     time.Duration
 	warmupUntil atomic.Value // time.Time
+}
+
+// udpBundle — набор UDP listeners на одном адресе/порту.
+type udpBundle struct {
+	listeners []*udpState
+	primary   *udpState
+	closeOnce sync.Once
 }
 
 //
@@ -142,6 +194,18 @@ func loadConfig(path string) (Config, error) {
 	if cfg.Tun.Name == "" {
 		cfg.Tun.Name = "tun0"
 	}
+	if cfg.Tun.Queues == 0 {
+		cfg.Tun.Queues = 1
+	}
+	if cfg.Tun.Queues < 1 || cfg.Tun.Queues > 64 {
+		return cfg, errors.New("tun.queues вне диапазона 1..64")
+	}
+	if cfg.Tun.LinkMTU == 0 {
+		cfg.Tun.LinkMTU = 9000
+	}
+	if cfg.Tun.LinkMTU < 576 || cfg.Tun.LinkMTU > 65535 {
+		return cfg, errors.New("link_mtu вне диапазона 576..65535")
+	}
 	if cfg.Tun.MTU == 0 {
 		cfg.Tun.MTU = 9000
 	}
@@ -150,6 +214,15 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.Transport.Listen == "" {
 		cfg.Transport.Listen = "0.0.0.0:5555"
+	}
+	if cfg.Transport.Listeners == 0 {
+		cfg.Transport.Listeners = 1
+	}
+	if cfg.Transport.Listeners < 1 || cfg.Transport.Listeners > 64 {
+		return cfg, errors.New("transport.listeners вне диапазона 1..64")
+	}
+	if cfg.Transport.Listeners > 1 && !cfg.Transport.ReusePort {
+		return cfg, errors.New("transport.listeners > 1 требует reuse_port=true")
 	}
 	if cfg.Transport.UDPRcv == 0 {
 		cfg.Transport.UDPRcv = 32 << 20
@@ -170,6 +243,32 @@ func loadConfig(path string) (Config, error) {
 		cfg.Batch.Warmup = 2 * time.Second
 	}
 	return cfg, nil
+}
+
+// startPprofServer — запустить HTTP pprof сервер до отмены контекста.
+// Вход: ctx, listen. Выход: ошибка бинда или nil.
+func startPprofServer(ctx context.Context, listen string) error {
+	if strings.TrimSpace(listen) == "" {
+		return nil
+	}
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("pprof serve", "listen", listen, "err", err)
+		}
+	}()
+	slog.Info("pprof started", "listen", listen)
+	return nil
 }
 
 // clamp — ограничить x в [lo,hi].
@@ -194,16 +293,66 @@ func rip4(ip net.IP) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
-//
-// ============================= TUN I/O ================================
-//
+// isWouldBlockErr — true для EAGAIN/EWOULDBLOCK.
+// Вход: err. Выход: bool.
+func isWouldBlockErr(err error) bool {
+	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
+}
+
+// isTempRecvErr — временные ошибки RX.
+// Вход: err. Выход: true если ошибку можно переждать и продолжить.
+func isTempRecvErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isWouldBlockErr(err) || errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var ne *net.OpError
+	if errors.As(err, &ne) {
+		if ne.Timeout() {
+			return true
+		}
+		return isTempRecvErr(ne.Err)
+	}
+	var se *os.SyscallError
+	if errors.As(err, &se) {
+		return isTempRecvErr(se.Err)
+	}
+	return false
+}
+
+// resolveIPv4Endpoint — нормализовать и заранее подготовить IPv4 UDP endpoint.
+// Вход: raw endpoint "host:port". Выход: resolvedEndpoint или ошибка.
+func resolveIPv4Endpoint(raw string) (resolvedEndpoint, error) {
+	addr, err := net.ResolveUDPAddr("udp4", strings.TrimSpace(raw))
+	if err != nil {
+		return resolvedEndpoint{}, err
+	}
+	if addr == nil || addr.IP == nil {
+		return resolvedEndpoint{}, errors.New("empty resolved endpoint")
+	}
+	ip4 := addr.IP.To4()
+	if ip4 == nil {
+		return resolvedEndpoint{}, errors.New("IPv4 endpoint required")
+	}
+	udpAddr := &net.UDPAddr{IP: append(net.IP(nil), ip4...), Port: addr.Port}
+	sock4 := &unix.SockaddrInet4{Port: addr.Port}
+	copy(sock4.Addr[:], ip4)
+	return resolvedEndpoint{
+		key:     net.JoinHostPort(udpAddr.IP.String(), strconv.Itoa(udpAddr.Port)),
+		udpAddr: udpAddr,
+		sock4:   sock4,
+	}, nil
+}
 
 // ioctl константы для TUN (без vnet_hdr/mergeable).
 const (
-	iffTUN    = 0x0001
-	iffNO_PI  = 0x1000
-	IFNAMSIZ  = 16
-	TUNSETIFF = 0x400454ca
+	iffTUN        = 0x0001
+	iffNO_PI      = 0x1000
+	iffMULTIQueue = 0x0100
+	IFNAMSIZ      = 16
+	TUNSETIFF     = 0x400454ca
 )
 
 // ifreq — аргумент ioctl(TUNSETIFF).
@@ -213,21 +362,20 @@ type ifreq struct {
 	Pad   [22]byte
 }
 
-// openTUN — открыть /dev/net/tun, создать TUN и включить non-blocking.
-// Назначение: подготовить TUN для L3 без доп. заголовков.
-// Вход: name (строка интерфейса). Выход: *tunDevice или ошибка.
-func openTUN(name string) (*tunDevice, error) {
+// openTUNQueue — открыть /dev/net/tun и привязать одну очередь интерфейса.
+// Вход: name, flags. Выход: *tunDevice или ошибка.
+func openTUNQueue(name string, flags uint16) (*tunDevice, error) {
 	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
 	if err != nil {
 		return nil, errors.New("open /dev/net/tun: " + err.Error())
 	}
 	var req ifreq
 	copy(req.Name[:], name)
-	req.Flags = iffTUN | iffNO_PI
+	req.Flags = flags
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&req)))
 	if errno != 0 {
 		_ = syscall.Close(fd)
-		return nil, errors.New("ioctl TUNSETIFF")
+		return nil, errors.New("ioctl TUNSETIFF: " + errno.Error())
 	}
 	if err := unix.SetNonblock(fd, true); err != nil {
 		_ = syscall.Close(fd)
@@ -236,29 +384,83 @@ func openTUN(name string) (*tunDevice, error) {
 	return &tunDevice{fd: fd}, nil
 }
 
-// ReadNB — неблокирующее чтение L3-пакета из TUN.
+// openTUN — открыть одну или несколько очередей TUN под одним именем интерфейса.
+// Вход: name, queueCount. Выход: *tunBundle или ошибка.
+func openTUN(name string, queueCount int) (*tunBundle, error) {
+	flags := uint16(iffTUN | iffNO_PI)
+	if queueCount > 1 {
+		flags |= iffMULTIQueue
+	}
+	bundle := &tunBundle{name: name, queues: make([]*tunDevice, 0, queueCount)}
+	for i := 0; i < queueCount; i++ {
+		tun, err := openTUNQueue(name, flags)
+		if err != nil {
+			_ = bundle.Close()
+			return nil, err
+		}
+		bundle.queues = append(bundle.queues, tun)
+	}
+	return bundle, nil
+}
+
+// ReadNB — неблокирующее чтение L3-пакета из очереди TUN.
 // Вход: p — буфер (вмещает linkMTU). Выход: длина L3; 0 при EAGAIN; ошибка при сбое.
 func (t *tunDevice) ReadNB(p []byte) (int, error) {
 	n, err := syscall.Read(t.fd, p)
-	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+	if isWouldBlockErr(err) {
 		return 0, nil
 	}
 	return n, err
 }
 
-// WriteL3 — запись L3-пакета в TUN.
+// WriteL3 — запись L3-пакета в очередь TUN.
 // Вход: pkt — L3 пакет. Выход: число записанных байт или ошибка.
 func (t *tunDevice) WriteL3(pkt []byte) (int, error) {
-	n, err := syscall.Write(t.fd, pkt)
-	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-		return 0, nil
-	}
-	return n, err
+	return syscall.Write(t.fd, pkt)
 }
 
-// Close — закрыть TUN.
-// Вход: нет. Выход: ошибка ОС (если была).
-func (t *tunDevice) Close() error { return syscall.Close(t.fd) }
+// WriteL3Context — записать L3-пакет в TUN, дождавшись writable при EAGAIN.
+// Вход: ctx, pkt, waitCounter. Выход: ошибка записи или nil.
+func (t *tunDevice) WriteL3Context(ctx context.Context, pkt []byte, waitCounter *atomic.Uint64) error {
+	pfd := []unix.PollFd{{Fd: int32(t.fd), Events: unix.POLLOUT}}
+	for {
+		n, err := t.WriteL3(pkt)
+		if err == nil {
+			if n != len(pkt) {
+				return fmt.Errorf("short tun write: %d of %d", n, len(pkt))
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if isWouldBlockErr(err) {
+			if waitCounter != nil {
+				waitCounter.Add(1)
+			}
+			_, _ = unix.Poll(pfd, 50)
+			continue
+		}
+		return err
+	}
+}
+
+// Close — закрыть все очереди TUN.
+// Вход: нет. Выход: первая ошибка ОС (если была).
+func (t *tunBundle) Close() error {
+	var closeErr error
+	t.closeOnce.Do(func() {
+		for _, q := range t.queues {
+			if err := syscall.Close(q.fd); err != nil && closeErr == nil {
+				closeErr = err
+			}
+		}
+	})
+	return closeErr
+}
 
 // configureTUN — поднять интерфейс, адрес/MTU, при необходимости маршрут.
 // Вход: name, cidr, linkMTU, addRoute. Выход: фактический MTU линка или ошибка.
@@ -334,7 +536,7 @@ func addGrayRoutes(tunName string, cidrs []string) error {
 // Вход: нет. Выход: *peerMap.
 func newPeerMap() *peerMap {
 	pm := &peerMap{}
-	pm.v.Store(make(map[uint32]string))
+	pm.v.Store(make(map[uint32]resolvedEndpoint))
 	return pm
 }
 
@@ -348,21 +550,17 @@ func (pm *peerMap) loadFromTOML(path string) error {
 	if len(pf.Peers) == 0 {
 		return errors.New("empty peers in mapping TOML")
 	}
-	tmp := make(map[uint32]string, len(pf.Peers))
+	tmp := make(map[uint32]resolvedEndpoint, len(pf.Peers))
 	for gray, white := range pf.Peers {
 		ip := net.ParseIP(strings.TrimSpace(gray))
 		if ip == nil || ip.To4() == nil {
 			return errors.New("map: IPv4 required: " + gray)
 		}
-		host, port, err := net.SplitHostPort(strings.TrimSpace(white))
+		endpoint, err := resolveIPv4Endpoint(white)
 		if err != nil {
-			return errors.New("map: host:port invalid for " + gray)
+			return errors.New("map: endpoint invalid for " + gray + ": " + err.Error())
 		}
-		rip, err := net.ResolveIPAddr("ip", host)
-		if err != nil || rip == nil || rip.IP == nil || rip.IP.To4() == nil {
-			return errors.New("map: host invalid for " + gray)
-		}
-		tmp[rip4(ip)] = net.JoinHostPort(rip.IP.String(), port)
+		tmp[rip4(ip)] = endpoint
 	}
 	pm.v.Store(tmp)
 	return nil
@@ -370,28 +568,28 @@ func (pm *peerMap) loadFromTOML(path string) error {
 
 // lookup — быстрый поиск endpoint по dst IPv4 без блокировок.
 // Вход: dstIPv4 — 4 байта адреса. Выход: endpoint и ok.
-func (pm *peerMap) lookup(dstIPv4 []byte) (string, bool) {
+func (pm *peerMap) lookup(dstIPv4 []byte) (resolvedEndpoint, bool) {
 	if len(dstIPv4) != 4 {
-		return "", false
+		return resolvedEndpoint{}, false
 	}
 	key := uint32(dstIPv4[0])<<24 | uint32(dstIPv4[1])<<16 | uint32(dstIPv4[2])<<8 | uint32(dstIPv4[3])
-	m := pm.v.Load().(map[uint32]string)
-	ep, ok := m[key]
-	return ep, ok
+	m := pm.v.Load().(map[uint32]resolvedEndpoint)
+	endpoint, ok := m[key]
+	return endpoint, ok
 }
 
 // endpoints — уникальные endpoints для прогрева.
 // Вход: нет. Выход: список уникальных "ip:port".
-func (pm *peerMap) endpoints() []string {
-	m := pm.v.Load().(map[uint32]string)
+func (pm *peerMap) endpoints() []resolvedEndpoint {
+	m := pm.v.Load().(map[uint32]resolvedEndpoint)
 	seen := make(map[string]struct{}, len(m))
-	out := make([]string, 0, len(m))
-	for _, ep := range m {
-		if _, ok := seen[ep]; ok {
+	out := make([]resolvedEndpoint, 0, len(m))
+	for _, endpoint := range m {
+		if _, ok := seen[endpoint.key]; ok {
 			continue
 		}
-		seen[ep] = struct{}{}
-		out = append(out, ep)
+		seen[endpoint.key] = struct{}{}
+		out = append(out, endpoint)
 	}
 	return out
 }
@@ -417,44 +615,40 @@ func ipv4Dst(pkt []byte) ([]byte, bool) {
 // =============================== UDP ================================
 //
 
-// newUDP — создать UDP-сокет, задать опции, zerocopy и размеры буферов.
-// Вход: listen, rcv, snd, zerocopy, zcMin, udpgsoMSS, aggregate.
-// Выход: *udpState или ошибка.
-func newUDP(listen string, rcv, snd int, zerocopy bool, zcMin, udpgsoMSS int, aggregate bool) (*udpState, error) {
-	laddr, err := net.ResolveUDPAddr("udp", listen)
-	if err != nil {
-		return nil, err
-	}
-	c, err := net.ListenUDP("udp", laddr)
-	if err != nil {
-		return nil, err
-	}
+// newUDPState — обернуть UDP сокет, включить опции и собрать runtime state.
+// Вход: conn, rcv, snd, zerocopy, zcMin, shared. Выход: *udpState или ошибка.
+func newUDPState(conn *net.UDPConn, rcv, snd int, zerocopy bool, zcMin int, shared *udpShared) (*udpState, error) {
 	// запросить размеры буферов от конфигурации
-	_ = c.SetReadBuffer(rcv)
-	_ = c.SetWriteBuffer(snd)
+	_ = conn.SetReadBuffer(rcv)
+	_ = conn.SetWriteBuffer(snd)
 
-	pc := ipv4.NewPacketConn(c)
+	pc := ipv4.NewPacketConn(conn)
 
 	// сырой fd
 	var fd int
-	if sc, err := c.SyscallConn(); err == nil {
+	if sc, err := conn.SyscallConn(); err == nil {
 		_ = sc.Control(func(f uintptr) { fd = int(f) })
 	}
 
 	u := &udpState{
-		conn:      c,
-		pc:        pc,
-		fd:        fd,
-		zerocp:    false,
-		zcMin:     zcMin,
-		udpgsoMSS: udpgsoMSS,
-		aggInner:  aggregate,
-		r4:        make(map[string]*net.UDPAddr),
-		rs4:       make(map[string]*unix.SockaddrInet4),
-		lastLog:   make(map[string]time.Time),
-		logCool:   5 * time.Second,
-		rcvSz:     rcv,
-		sndSz:     snd,
+		conn:   conn,
+		pc:     pc,
+		fd:     fd,
+		zerocp: false,
+		zcMin:  zcMin,
+		rcvSz:  rcv,
+		sndSz:  snd,
+		shared: shared,
+	}
+
+	// Пробуем обойти rmem_max/wmem_max, если процессу доступен FORCE-вариант.
+	if fd > 0 {
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, rcv); err != nil {
+			_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, rcv)
+		}
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, snd); err != nil {
+			_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, snd)
+		}
 	}
 
 	// прочитать фактические SO_RCVBUF/SO_SNDBUF (ядро может масштабировать)
@@ -484,60 +678,113 @@ func newUDP(listen string, rcv, snd int, zerocopy bool, zcMin, udpgsoMSS int, ag
 		}
 	}
 
-	// Инициализация атомарного значения
-	u.warmupUntil.Store(time.Time{})
 	return u, nil
 }
 
-// close — закрыть UDP.
-// Вход: нет. Выход: нет.
-func (u *udpState) close() { _ = u.pc.Close(); _ = u.conn.Close() }
-
-// raddr — разрешить endpoint и закешировать sockaddr.
-// Вход: ep "ip:port". Выход: *net.UDPAddr, *unix.SockaddrInet4, ошибка.
-func (u *udpState) raddr(ep string) (*net.UDPAddr, *unix.SockaddrInet4, error) {
-	u.mu.RLock()
-	if a, ok := u.r4[ep]; ok {
-		if rs, ok2 := u.rs4[ep]; ok2 {
-			u.mu.RUnlock()
-			return a, rs, nil
+// listenUDP — открыть UDP listener, при необходимости с SO_REUSEPORT.
+// Вход: listen, reusePort. Выход: *net.UDPConn или ошибка.
+func listenUDP(listen string, reusePort bool) (*net.UDPConn, error) {
+	if !reusePort {
+		laddr, err := net.ResolveUDPAddr("udp4", listen)
+		if err != nil {
+			return nil, err
 		}
-		u.mu.RUnlock()
-		return a, nil, nil
+		return net.ListenUDP("udp4", laddr)
 	}
-	u.mu.RUnlock()
-
-	host, portStr, err := net.SplitHostPort(ep)
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockErr error
+			if err := c.Control(func(fd uintptr) {
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+					sockErr = err
+					return
+				}
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+					sockErr = err
+				}
+			}); err != nil {
+				return err
+			}
+			return sockErr
+		},
+	}
+	pc, err := lc.ListenPacket(context.Background(), "udp4", listen)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	rip, err := net.ResolveIPAddr("ip", host)
-	if err != nil || rip == nil || rip.IP == nil || rip.IP.To4() == nil {
-		return nil, nil, errors.New("resolve: " + ep)
+	conn, ok := pc.(*net.UDPConn)
+	if !ok {
+		_ = pc.Close()
+		return nil, errors.New("unexpected UDP listener type")
 	}
-	port, _ := strconv.Atoi(portStr)
-	na := &net.UDPAddr{IP: rip.IP, Port: port}
-	sa := &unix.SockaddrInet4{Port: port}
-	copy(sa.Addr[:], rip.IP.To4())
+	return conn, nil
+}
 
-	u.mu.Lock()
-	u.r4[ep] = na
-	u.rs4[ep] = sa
-	u.mu.Unlock()
-	return na, sa, nil
+// newUDPBundle — создать один или несколько reuseport-bound UDP listeners.
+// Вход: listen, listenerCount, rcv, snd, reusePort, zerocopy, zcMin. Выход: *udpBundle или ошибка.
+func newUDPBundle(listen string, listenerCount, rcv, snd int, reusePort, zerocopy bool, zcMin int) (*udpBundle, error) {
+	shared := &udpShared{
+		lastLog: make(map[string]time.Time),
+		logCool: 5 * time.Second,
+	}
+	shared.warmupUntil.Store(time.Time{})
+	bundle := &udpBundle{listeners: make([]*udpState, 0, listenerCount)}
+	for i := 0; i < listenerCount; i++ {
+		conn, err := listenUDP(listen, reusePort)
+		if err != nil {
+			bundle.close()
+			return nil, err
+		}
+		u, err := newUDPState(conn, rcv, snd, zerocopy, zcMin, shared)
+		if err != nil {
+			_ = conn.Close()
+			bundle.close()
+			return nil, err
+		}
+		bundle.listeners = append(bundle.listeners, u)
+	}
+	if len(bundle.listeners) == 0 {
+		return nil, errors.New("no UDP listeners created")
+	}
+	bundle.primary = bundle.listeners[0]
+	return bundle, nil
+}
+
+// close — закрыть UDP listener.
+// Вход: нет. Выход: нет.
+func (u *udpState) close() {
+	u.closeOnce.Do(func() {
+		_ = u.pc.Close()
+		_ = u.conn.Close()
+	})
+}
+
+// close — закрыть весь UDP bundle.
+// Вход: нет. Выход: нет.
+func (b *udpBundle) close() {
+	b.closeOnce.Do(func() {
+		for _, u := range b.listeners {
+			u.close()
+		}
+	})
 }
 
 // setWarmupUntil — установить дедлайн прогрева.
 // Вход: t. Выход: нет.
 func (u *udpState) setWarmupUntil(t time.Time) {
-	u.warmupUntil.Store(t)
+	u.shared.warmupUntil.Store(t)
+}
+
+// inWarmup — true, пока не истёк дедлайн прогрева.
+// Вход: now. Выход: bool.
+func (u *udpState) inWarmup(now time.Time) bool {
+	return now.Before(u.shared.warmupUntil.Load().(time.Time))
 }
 
 // phase — текущая фаза: "warmup" или "tx".
 // Вход: нет. Выход: строка фазы.
 func (u *udpState) phase() string {
-	t := u.warmupUntil.Load().(time.Time)
-	if time.Now().Before(t) {
+	if u.inWarmup(time.Now()) {
 		return "warmup"
 	}
 	return "tx"
@@ -547,15 +794,117 @@ func (u *udpState) phase() string {
 // Вход: ep, phase, reason, err. Выход: нет.
 func (u *udpState) notePeerUnavailable(ep, phase, reason string, err error) {
 	now := time.Now()
-	u.mu.Lock()
-	last := u.lastLog[ep]
-	if now.Sub(last) < u.logCool {
-		u.mu.Unlock()
+	u.shared.logMu.Lock()
+	last := u.shared.lastLog[ep]
+	if now.Sub(last) < u.shared.logCool {
+		u.shared.logMu.Unlock()
 		return
 	}
-	u.lastLog[ep] = now
-	u.mu.Unlock()
+	u.shared.lastLog[ep] = now
+	u.shared.logMu.Unlock()
 	slog.Error("peer unavailable", "peer", ep, "phase", phase, "reason", reason, "err", err)
+}
+
+// newRXIngress — создать общую RX очередь и TUN writer state.
+// Вход: tun, effMTU, queueDepth. Выход: *rxIngress.
+func newRXIngress(tun *tunDevice, effMTU, queueDepth int) *rxIngress {
+	return &rxIngress{
+		packets: make(chan rxPacket, queueDepth),
+		pool: &sync.Pool{
+			New: func() any { return make([]byte, effMTU) },
+		},
+		tun:    tun,
+		effMTU: effMTU,
+	}
+}
+
+// noteQueueDepth — обновить high-water mark RX очереди.
+// Вход: depth. Выход: нет.
+func (r *rxIngress) noteQueueDepth(depth int) {
+	for {
+		old := r.stats.queueHighWater.Load()
+		if uint64(depth) <= old || r.stats.queueHighWater.CompareAndSwap(old, uint64(depth)) {
+			return
+		}
+	}
+}
+
+// enqueuePacket — скопировать пакет в RX очередь для TUN writer.
+// Вход: ctx, pkt. Выход: ошибка или nil.
+func (r *rxIngress) enqueuePacket(ctx context.Context, pkt []byte) error {
+	buf := r.pool.Get().([]byte)
+	copy(buf[:len(pkt)], pkt)
+	packet := rxPacket{buf: buf[:len(pkt)]}
+
+	select {
+	case r.packets <- packet:
+		r.stats.enqueued.Add(1)
+		r.noteQueueDepth(len(r.packets))
+		return nil
+	default:
+		r.stats.queueWaits.Add(1)
+	}
+
+	select {
+	case r.packets <- packet:
+		r.stats.enqueued.Add(1)
+		r.noteQueueDepth(len(r.packets))
+		return nil
+	case <-ctx.Done():
+		r.pool.Put(packet.buf[:r.effMTU])
+		return nil
+	}
+}
+
+// drainPackets — вернуть буферы из очереди в pool.
+// Вход: нет. Выход: нет.
+func (r *rxIngress) drainPackets() {
+	for {
+		select {
+		case pkt := <-r.packets:
+			r.pool.Put(pkt.buf[:r.effMTU])
+		default:
+			return
+		}
+	}
+}
+
+// writeLoop — отдельный writer RX очереди в TUN.
+// Вход: ctx. Выход: ошибка или nil.
+func (r *rxIngress) writeLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			r.drainPackets()
+			return nil
+		case pkt := <-r.packets:
+			if err := r.tun.WriteL3Context(ctx, pkt.buf, &r.stats.tunWriteWaits); err != nil {
+				r.pool.Put(pkt.buf[:r.effMTU])
+				if ctx.Err() != nil {
+					r.drainPackets()
+					return nil
+				}
+				r.drainPackets()
+				return fmt.Errorf("tun write: %w", err)
+			}
+			r.stats.written.Add(1)
+			r.pool.Put(pkt.buf[:r.effMTU])
+		}
+	}
+}
+
+// logStats — записать итоговые счётчики RX очереди.
+// Вход: нет. Выход: нет.
+func (r *rxIngress) logStats() {
+	slog.Info("rx ingress stats",
+		"enqueued", r.stats.enqueued.Load(),
+		"written", r.stats.written.Load(),
+		"queue_waits", r.stats.queueWaits.Load(),
+		"queue_high_water", r.stats.queueHighWater.Load(),
+		"queue_depth", len(r.packets),
+		"queue_capacity", cap(r.packets),
+		"tun_write_waits", r.stats.tunWriteWaits.Load(),
+	)
 }
 
 // isTempSendErr — временные ошибки TX.
@@ -564,7 +913,7 @@ func isTempSendErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.ENOBUFS) {
+	if isWouldBlockErr(err) || errors.Is(err, syscall.ENOBUFS) {
 		return true
 	}
 	var ne *net.OpError
@@ -607,7 +956,7 @@ func (u *udpState) startErrMonitor(ctx context.Context, tick time.Duration) {
 			_, _ = unix.Poll(pfd, timeoutMS)
 			for {
 				n, oobn, _, _, err := unix.Recvmsg(u.fd, buf, oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
-				if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+				if isWouldBlockErr(err) {
 					break
 				}
 				if err != nil {
@@ -647,25 +996,6 @@ func parseUDPEndpointFromICMPPayload(buf []byte) (string, bool) {
 	return net.JoinHostPort(dstIP, strconv.Itoa(dstPort)), true
 }
 
-//
-// =============================== UDP_SEGMENT ==========================
-//
-
-// buildUDPSegmentCMSG — построить cmsg UDP_SEGMENT на MSS байт.
-// Вход: mss. Выход: байты cmsg.
-func buildUDPSegmentCMSG(mss uint16) []byte {
-	hlen := unix.CmsgSpace(2) // 2 байта данных
-	buf := make([]byte, hlen)
-	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
-	h.Level = unix.SOL_UDP
-	h.Type = unix.UDP_SEGMENT
-	h.SetLen(unix.CmsgLen(2))
-	data := buf[unix.CmsgLen(0):unix.CmsgLen(2)]
-	binary.LittleEndian.PutUint16(data[:2], mss)
-	return buf
-}
-
-//
 // =============================== main ================================
 //
 
@@ -684,6 +1014,12 @@ func main() {
 	}
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.Log.Level)})
 	slog.SetDefault(slog.New(h))
+	if cfg.Transport.AggregateInn || cfg.Transport.UDPGSOMSS > 0 {
+		slog.Warn("deprecated transport options ignored",
+			"aggregate_inner", cfg.Transport.AggregateInn,
+			"udpgso_mss", cfg.Transport.UDPGSOMSS,
+		)
+	}
 
 	pm := newPeerMap()
 	if err := pm.loadFromTOML(cfg.Map.Path); err != nil {
@@ -692,7 +1028,7 @@ func main() {
 	}
 
 	// Открыть TUN (чистый L3).
-	tun, err := openTUN(cfg.Tun.Name)
+	tun, err := openTUN(cfg.Tun.Name, cfg.Tun.Queues)
 	if err != nil {
 		slog.Error("tun open", "err", err)
 		os.Exit(1)
@@ -702,12 +1038,13 @@ func main() {
 	// Контекст завершения.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := startPprofServer(ctx, cfg.Debug.PprofListen); err != nil {
+		slog.Error("pprof start", "listen", cfg.Debug.PprofListen, "err", err)
+		os.Exit(1)
+	}
 
 	// Настройка линка/адреса/маршрутов.
 	reqLinkMTU := cfg.Tun.LinkMTU
-	if reqLinkMTU == 0 && cfg.Tun.MTU > 0 {
-		reqLinkMTU = cfg.Tun.MTU
-	}
 	linkMTU, err := configureTUN(cfg.Tun.Name, cfg.Tun.Addr, reqLinkMTU, cfg.Tun.AddRoute)
 	if err != nil {
 		slog.Error("tun configure", "err", err)
@@ -733,7 +1070,8 @@ func main() {
 	if effMTU < 576 {
 		effMTU = 576
 	}
-	// Понизим link MTU до effMTU (исключить несогласованность).
+	// Держим фактический MTU TUN согласованным с безопасным inner MTU,
+	// иначе локальный стек начнёт генерировать inner-пакеты больше effMTU.
 	if linkMTU > effMTU {
 		if link, err := netlink.LinkByName(cfg.Tun.Name); err == nil {
 			if err := netlink.LinkSetMTU(link, effMTU); err != nil {
@@ -744,82 +1082,159 @@ func main() {
 			}
 		}
 	}
-
-	udp, err := newUDP(cfg.Transport.Listen, cfg.Transport.UDPRcv, cfg.Transport.UDPSnd,
-		cfg.Transport.ZeroCopy, cfg.Transport.ZCMinBytes, cfg.Transport.UDPGSOMSS, cfg.Transport.AggregateInn)
+	udp, err := newUDPBundle(cfg.Transport.Listen, cfg.Transport.Listeners,
+		cfg.Transport.UDPRcv, cfg.Transport.UDPSnd, cfg.Transport.ReusePort,
+		cfg.Transport.ZeroCopy, cfg.Transport.ZCMinBytes)
 	if err != nil {
 		slog.Error("udp listen", "err", err)
 		os.Exit(1)
 	}
 	defer udp.close()
-	udp.setWarmupUntil(time.Now().Add(cfg.Batch.Warmup))
+	udp.primary.setWarmupUntil(time.Now().Add(cfg.Batch.Warmup))
 
 	// Период опроса error-queue = min(hold, 20ms).
 	errqTick := cfg.Batch.Hold
 	if errqTick <= 0 || errqTick > 20*time.Millisecond {
 		errqTick = 20 * time.Millisecond
 	}
-	udp.startErrMonitor(ctx, errqTick)
+	udp.primary.startErrMonitor(ctx, errqTick)
 
-	// Адаптивные батчи от фактических буферов сокета.
-	targetBatchBytesRX := clamp(udp.rcvSz/4, effMTU, 2<<20)
-	targetBatchBytesTX := clamp(udp.sndSz/4, effMTU, 2<<20)
-	pktLimitRX := clamp(targetBatchBytesRX/effMTU, 1, 2048)
-	pktLimitTX := clamp(targetBatchBytesTX/effMTU, 1, 2048)
+	// Адаптивные батчи от фактических буферов сокета, но с жёстким upper bound,
+	// чтобы не устраивать локальные microbursts.
+	const maxRXBatchBytes = 512 << 10
+	const maxRXBurstPackets = 64
+	const maxTXBatchBytes = 64 << 10
+	const maxTXBurstPackets = 4
+	targetBatchBytesRX := clamp(udp.primary.rcvSz/4, effMTU, maxRXBatchBytes)
+	targetBatchBytesTX := clamp(udp.primary.sndSz/4, effMTU, maxTXBatchBytes)
+	perListenerBatchBytesRX := clamp(targetBatchBytesRX/len(udp.listeners), effMTU, 2<<20)
+	pktLimitRX := clamp(perListenerBatchBytesRX/effMTU, 1, maxRXBurstPackets)
+	pktLimitTX := clamp(targetBatchBytesTX/effMTU, 1, maxTXBurstPackets)
+	perWorkerPktLimitTX := clamp(pktLimitTX/len(tun.queues), 1, 2048)
+	rxQueueDepth := clamp(pktLimitRX*8, 256, 4096)
+	txMaxHold := cfg.Batch.Hold
+	if txMaxHold <= 0 || txMaxHold > 25*time.Microsecond {
+		txMaxHold = 25 * time.Microsecond
+	}
 
 	slog.Debug("Starting...",
 		"listen", cfg.Transport.Listen,
+		"udp_listeners", len(udp.listeners), "reuse_port", cfg.Transport.ReusePort,
 		"udp_rbuf_req", cfg.Transport.UDPRcv, "udp_wbuf_req", cfg.Transport.UDPSnd,
-		"udp_rbuf_act", udp.rcvSz, "udp_wbuf_act", udp.sndSz,
+		"udp_rbuf_act", udp.primary.rcvSz, "udp_wbuf_act", udp.primary.sndSz,
 		"batch_bytes_rx", targetBatchBytesRX, "batch_bytes_tx", targetBatchBytesTX,
-		"pkt_limit_rx", pktLimitRX, "pkt_limit_tx", pktLimitTX,
+		"batch_bytes_rx_listener", perListenerBatchBytesRX,
+		"rx_queue_depth", rxQueueDepth,
+		"pkt_limit_rx_listener", pktLimitRX, "pkt_limit_tx_total", pktLimitTX,
+		"pkt_limit_tx_worker", perWorkerPktLimitTX,
 		"cfg_mtu", cfg.Tun.MTU, "link_mtu", linkMTU, "eff_mtu", effMTU,
-		"hold", cfg.Batch.Hold, "warmup", cfg.Batch.Warmup,
+		"hold", cfg.Batch.Hold, "tx_hold", txMaxHold, "warmup", cfg.Batch.Warmup,
 		"zerocopy", cfg.Transport.ZeroCopy, "zc_min_bytes", cfg.Transport.ZCMinBytes,
-		"udpgso_mss", cfg.Transport.UDPGSOMSS, "aggregate_inner", cfg.Transport.AggregateInn,
-		"tun", cfg.Tun.Name,
+		"tun", cfg.Tun.Name, "tun_queues", len(tun.queues),
 	)
 
-	slog.Info("Service started", "tun", cfg.Tun.Name)
+	slog.Info("Service started", "tun", cfg.Tun.Name, "tun_queues", len(tun.queues))
 
 	// Прогрев пиров.
-	prewarmEndpoints(udp, pm)
+	prewarmEndpoints(udp.primary, pm)
 
-	// RX: UDP → TUN.
-	go rxLoop(ctx, udp, tun, effMTU, pktLimitRX, cfg.Batch.Hold)
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(tun.queues)+len(udp.listeners)+16)
+	rxIngress := newRXIngress(tun.queues[0], effMTU, rxQueueDepth)
 
-	// TX: TUN → UDP.
-	txLoop(ctx, udp, pm, tun, linkMTU, effMTU, pktLimitTX, cfg.Batch.Hold, cfg.Batch.Warmup)
+	reportAsyncErr := func(name string, err error) {
+		select {
+		case errCh <- fmt.Errorf("%s: %w", name, err):
+		default:
+		}
+		stop()
+	}
+
+	runWorker := func(name string, fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(); err != nil {
+				reportAsyncErr(name, err)
+			}
+		}()
+	}
+
+	runWorker("rx-write", func() error {
+		return rxIngress.writeLoop(ctx)
+	})
+	for idx, rxUDP := range udp.listeners {
+		idx := idx
+		rxUDP := rxUDP
+		workerName := fmt.Sprintf("rx[%d]", idx)
+		runWorker(workerName, func() error {
+			return rxReadLoop(ctx, rxUDP, rxIngress, effMTU, pktLimitRX)
+		})
+	}
+	for idx, queue := range tun.queues {
+		idx := idx
+		queue := queue
+		workerName := fmt.Sprintf("tx[%d]", idx)
+		runWorker(workerName, func() error {
+			return txLoop(ctx, udp.primary, pm, queue, linkMTU, effMTU, perWorkerPktLimitTX, txMaxHold)
+		})
+	}
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-errCh:
+	}
+	if runErr == nil {
+		select {
+		case runErr = <-errCh:
+		default:
+		}
+	}
+
+	udp.close()
+	_ = tun.Close()
+	wg.Wait()
+	rxIngress.logStats()
+	if runErr == nil {
+		select {
+		case runErr = <-errCh:
+		default:
+		}
+	}
+	if runErr != nil {
+		slog.Error("worker failed", "err", runErr)
+		os.Exit(1)
+	}
 }
 
 //
 // ============================ Конвейеры ===============================
 //
 
-// rxLoop — приём UDP батчами и запись в TUN (L3).
-// Вход: ctx, udp, tun, effMTU, pktLimit, hold. Выход: нет.
-func rxLoop(ctx context.Context, udp *udpState, tun *tunDevice, effMTU, pktLimit int, hold time.Duration) {
-	N := clamp(pktLimit*2, 128, 4096)
+// rxReadLoop — приём UDP батчами и быстрая постановка inner-пакетов в RX очередь.
+// Вход: ctx, udp, ingress, effMTU, pktLimit. Выход: ошибка worker или nil.
+func rxReadLoop(ctx context.Context, udp *udpState, ingress *rxIngress, effMTU, pktLimit int) error {
+	N := clamp(pktLimit*4, 64, 512)
 	msgs := make([]ipv4.Message, N)
 	bufs := make([][]byte, N)
 	for i := 0; i < N; i++ {
 		bufs[i] = make([]byte, effMTU)
 		msgs[i].Buffers = [][]byte{bufs[i]}
 	}
-	if hold <= 0 {
-		hold = 5 * time.Millisecond
-	}
 	for {
-		_ = udp.pc.SetReadDeadline(time.Now().Add(hold))
 		n, err := udp.pc.ReadBatch(msgs, 0)
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return nil
 			}
-			if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
+			if isTempRecvErr(err) {
+				time.Sleep(200 * time.Microsecond)
 				continue
 			}
-			time.Sleep(200 * time.Microsecond)
+			return fmt.Errorf("udp read batch: %w", err)
+		}
+		if n <= 0 {
 			continue
 		}
 		for i := 0; i < n; i++ {
@@ -827,19 +1242,23 @@ func rxLoop(ctx context.Context, udp *udpState, tun *tunDevice, effMTU, pktLimit
 			if ln <= 0 || ln > effMTU {
 				continue
 			}
-			if _, err := tun.WriteL3(bufs[i][:ln]); err != nil {
+			if _, ok := ipv4Dst(bufs[i][:ln]); !ok {
+				continue
+			}
+			if err := ingress.enqueuePacket(ctx, bufs[i][:ln]); err != nil {
 				if ctx.Err() != nil {
-					return
+					return nil
 				}
+				return fmt.Errorf("rx enqueue: %w", err)
 			}
 		}
 	}
 }
 
-// txLoop — чтение из TUN и отправка UDP.
-// Вход: ctx, udp, pm, tun, linkMTU, effMTU, pktLimit, maxHold, warm. Выход: нет.
-func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, linkMTU, effMTU, pktLimit int, maxHold, warm time.Duration) {
-	N := clamp(pktLimit*2, 128, 4096)
+// txLoop — чтение из одной очереди TUN и отправка UDP.
+// Вход: ctx, udp, pm, tun, linkMTU, effMTU, pktLimit, maxHold. Выход: ошибка worker или nil.
+func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, linkMTU, effMTU, pktLimit int, maxHold time.Duration) error {
+	N := clamp(pktLimit*2, 16, 128)
 
 	// Буферы чтения из TUN.
 	readBufs := make([][]byte, N)
@@ -853,36 +1272,44 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 		msgs[i].Buffers = make([][]byte, 1)
 	}
 
-	warmUntil := time.Now().Add(warm)
 	k := 0
 	batchStart := time.Now()
 
-	if maxHold <= 0 {
-		maxHold = 5 * time.Millisecond
-	}
 	timeoutMS := clamp(int(maxHold/time.Millisecond), 1, 200)
 	pfd := []unix.PollFd{{Fd: int32(tun.fd), Events: unix.POLLIN}}
 
-	flushCopy := func() {
-		if k > 0 {
-			_, _ = udp.pc.WriteBatch(msgs[:k], 0) // ошибки детектируем через error-queue
-			k = 0
-			batchStart = time.Now()
+	flushCopy := func() error {
+		for off := 0; off < k; {
+			n, err := udp.pc.WriteBatch(msgs[off:k], 0)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("udp write batch: %w", err)
+			}
+			if n <= 0 {
+				return errors.New("udp write batch wrote 0 messages")
+			}
+			off += n
 		}
+		k = 0
+		batchStart = time.Now()
+		return nil
 	}
 
 	for {
 		_, _ = unix.Poll(pfd, timeoutMS)
 		if ctx.Err() != nil {
-			flushCopy()
-			return
+			return flushCopy()
 		}
 
 		for k < N {
 			n, err := tun.ReadNB(readBufs[k][:linkMTU])
 			if err != nil {
-				flushCopy()
-				return
+				if ctx.Err() != nil {
+					return flushCopy()
+				}
+				return fmt.Errorf("tun read: %w", err)
 			}
 			if n == 0 {
 				break
@@ -897,32 +1324,21 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 			if !ok {
 				continue
 			}
-			ep, ok := pm.lookup(dst)
+			endpoint, ok := pm.lookup(dst)
 			if !ok {
-				continue
-			}
-			na, rsa, err := udp.raddr(ep)
-			if err != nil {
-				udp.notePeerUnavailable(ep, udp.phase(), "resolve_error", err)
 				continue
 			}
 
 			// zerocopy или копирующий путь
 			useZC := udp.zerocp && len(pkt) >= udp.zcMin
 
-			// UDP_SEGMENT: только при агрегации.
-			var oob []byte
-			if udp.aggInner && udp.udpgsoMSS > 0 && len(pkt) > udp.udpgsoMSS {
-				oob = buildUDPSegmentCMSG(uint16(udp.udpgsoMSS))
-			}
-
 			if useZC {
-				_, err := unix.SendmsgN(udp.fd, pkt, oob, rsa, unix.MSG_ZEROCOPY)
+				_, err := unix.SendmsgN(udp.fd, pkt, nil, endpoint.sock4, unix.MSG_ZEROCOPY)
 				if err != nil {
 					if isTempSendErr(err) {
-						_, _ = udp.conn.WriteToUDP(pkt, na)
+						_, _ = udp.conn.WriteToUDP(pkt, endpoint.udpAddr)
 					} else {
-						udp.notePeerUnavailable(ep, udp.phase(), "send_error", err)
+						udp.notePeerUnavailable(endpoint.key, udp.phase(), "send_error", err)
 					}
 				}
 				continue
@@ -930,15 +1346,18 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 
 			// Копирующий путь (батч).
 			msgs[k].Buffers[0] = pkt
-			msgs[k].Addr = na
+			msgs[k].Addr = endpoint.udpAddr
 			k++
 
-			if time.Now().Before(warmUntil) || k >= pktLimit || time.Since(batchStart) > maxHold {
+			now := time.Now()
+			if udp.inWarmup(now) || k >= pktLimit || now.Sub(batchStart) > maxHold {
 				break
 			}
 		}
 
-		flushCopy()
+		if err := flushCopy(); err != nil {
+			return err
+		}
 	}
 }
 
@@ -956,33 +1375,28 @@ func prewarmEndpoints(udp *udpState, pm *peerMap) {
 	const shots = 2
 	msgs := make([]ipv4.Message, 0, len(eps)*shots)
 
-	for _, ep := range eps {
-		na, _, err := udp.raddr(ep)
-		if err != nil {
-			udp.notePeerUnavailable(ep, "warmup", "resolve_error", err)
-			continue
-		}
+	for _, endpoint := range eps {
 		// пассивный прогрев (ARP/NAT/cache)
 		for i := 0; i < shots; i++ {
-			msgs = append(msgs, ipv4.Message{Buffers: [][]byte{{0}}, Addr: na})
+			msgs = append(msgs, ipv4.Message{Buffers: [][]byte{{0}}, Addr: endpoint.udpAddr})
 		}
 		// активная проверка ICMP Port Unreachable
 		func() {
-			c, err := net.DialUDP("udp", nil, na)
+			c, err := net.DialUDP("udp4", nil, endpoint.udpAddr)
 			if err != nil {
-				udp.notePeerUnavailable(ep, "warmup", "dial_error", err)
+				udp.notePeerUnavailable(endpoint.key, "warmup", "dial_error", err)
 				return
 			}
 			defer c.Close()
 			_ = c.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
 			if _, werr := c.Write([]byte{0}); werr != nil {
-				udp.notePeerUnavailable(ep, "warmup", "send_error", werr)
+				udp.notePeerUnavailable(endpoint.key, "warmup", "send_error", werr)
 				return
 			}
 			_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 			var b [1]byte
 			if _, rerr := c.Read(b[:]); isConnRefused(rerr) {
-				udp.notePeerUnavailable(ep, "warmup", "icmp_port_unreachable", rerr)
+				udp.notePeerUnavailable(endpoint.key, "warmup", "icmp_port_unreachable", rerr)
 			}
 		}()
 	}
