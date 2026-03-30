@@ -1,3 +1,5 @@
-# [peers] — соответствие dst IPv4 (серых) удалённым белым endpoint'ам (host:port)
+# sample peer map for /etc/l3overlay/peers.toml
+# overlay IPv4 destination -> remote underlay UDP endpoint
 [peers]
-"10.10.0.1" = "192.168.7.1:5555"   # узел-B: серый 10.10.0.2 → белый 198.51.100.2:5555
+"10.10.0.11" = "198.51.100.11:5555"
+"10.10.0.12" = "198.51.100.12:5555"

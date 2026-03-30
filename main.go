@@ -5,7 +5,7 @@
 //
 // Производительность:
 // - RX: ipv4.PacketConn.ReadBatch → запись в TUN (L3).
-// - TX: чтение из TUN (L3) → отправка UDP: копирующий батч WriteBatch или zerocopy SendmsgN.
+// - TX: чтение из TUN (L3) → отправка UDP: копирующий батч WriteBatch или GSO sendmsg.
 //
 // Логи недоступности пира: warmup и tx, троттлинг 5с/peer.
 
@@ -60,8 +60,8 @@ type Config struct {
 		ReusePort    bool   `toml:"reuse_port"`      // включить SO_REUSEPORT для multi-listener bind
 		UDPRcv       int    `toml:"udp_rbuf"`        // запрошенный SO_RCVBUF; 0 → 32MiB
 		UDPSnd       int    `toml:"udp_wbuf"`        // запрошенный SO_SNDBUF; 0 → 32MiB
-		ZeroCopy     bool   `toml:"zerocopy"`        // включить SO_ZEROCOPY
-		ZCMinBytes   int    `toml:"zc_min_bytes"`    // порог для zerocopy; 0 → 8192
+		ZeroCopy     bool   `toml:"zerocopy"`        // deprecated: игнорируется, сохранено для совместимости конфига
+		ZCMinBytes   int    `toml:"zc_min_bytes"`    // deprecated: сохранено для совместимости конфига
 		UDPGSOMSS    int    `toml:"udpgso_mss"`      // deprecated: игнорируется, сохранено для совместимости конфига
 		AggregateInn bool   `toml:"aggregate_inner"` // deprecated: игнорируется, сохранено для совместимости конфига
 	} `toml:"transport"`
@@ -102,6 +102,12 @@ type rxPacket struct {
 	buf []byte
 }
 
+// txPacket — inner-пакет и его уже разрешённый UDP endpoint для TX flush.
+type txPacket struct {
+	buf      []byte
+	endpoint resolvedEndpoint
+}
+
 // rxIngressStats — счётчики давления на RX очередь и записи в TUN.
 type rxIngressStats struct {
 	enqueued       atomic.Uint64
@@ -123,6 +129,7 @@ type rxIngress struct {
 // resolvedEndpoint — нормализованный IPv4 endpoint и готовые адресные формы для отправки.
 type resolvedEndpoint struct {
 	key     string
+	gsoKey  uint64
 	udpAddr *net.UDPAddr
 	sock4   *unix.SockaddrInet4
 }
@@ -139,6 +146,7 @@ type udpState struct {
 	fd     int
 	zerocp bool
 	zcMin  int
+	txGSO  atomic.Bool
 
 	rcvSz int // фактический SO_RCVBUF
 	sndSz int // фактический SO_SNDBUF
@@ -162,6 +170,8 @@ type udpBundle struct {
 	primary   *udpState
 	closeOnce sync.Once
 }
+
+const tunWriteRetryWait = 250 * time.Microsecond
 
 //
 // ============================== Утилиты ===============================
@@ -322,6 +332,27 @@ func isTempRecvErr(err error) bool {
 	return false
 }
 
+// waitFD — дождаться события на fd c точностью до наносекунд.
+// Вход: fd, events, timeout; timeout < 0 означает ждать без дедлайна. Выход: ошибка ОС или nil.
+func waitFD(fd int32, events int16, timeout time.Duration) error {
+	pfd := []unix.PollFd{{Fd: fd, Events: events}}
+	for {
+		var tsp *unix.Timespec
+		if timeout >= 0 {
+			ts := unix.NsecToTimespec(timeout.Nanoseconds())
+			tsp = &ts
+		}
+		_, err := unix.Ppoll(pfd, tsp, nil)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		return err
+	}
+}
+
 // resolveIPv4Endpoint — нормализовать и заранее подготовить IPv4 UDP endpoint.
 // Вход: raw endpoint "host:port". Выход: resolvedEndpoint или ошибка.
 func resolveIPv4Endpoint(raw string) (resolvedEndpoint, error) {
@@ -341,6 +372,7 @@ func resolveIPv4Endpoint(raw string) (resolvedEndpoint, error) {
 	copy(sock4.Addr[:], ip4)
 	return resolvedEndpoint{
 		key:     net.JoinHostPort(udpAddr.IP.String(), strconv.Itoa(udpAddr.Port)),
+		gsoKey:  uint64(rip4(ip4))<<16 | uint64(uint16(addr.Port)),
 		udpAddr: udpAddr,
 		sock4:   sock4,
 	}, nil
@@ -422,7 +454,6 @@ func (t *tunDevice) WriteL3(pkt []byte) (int, error) {
 // WriteL3Context — записать L3-пакет в TUN, дождавшись writable при EAGAIN.
 // Вход: ctx, pkt, waitCounter. Выход: ошибка записи или nil.
 func (t *tunDevice) WriteL3Context(ctx context.Context, pkt []byte, waitCounter *atomic.Uint64) error {
-	pfd := []unix.PollFd{{Fd: int32(t.fd), Events: unix.POLLOUT}}
 	for {
 		n, err := t.WriteL3(pkt)
 		if err == nil {
@@ -441,7 +472,12 @@ func (t *tunDevice) WriteL3Context(ctx context.Context, pkt []byte, waitCounter 
 			if waitCounter != nil {
 				waitCounter.Add(1)
 			}
-			_, _ = unix.Poll(pfd, 50)
+			if err := waitFD(int32(t.fd), unix.POLLOUT, tunWriteRetryWait); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
 			continue
 		}
 		return err
@@ -611,6 +647,44 @@ func ipv4Dst(pkt []byte) ([]byte, bool) {
 	return pkt[16:20], true
 }
 
+// udpSegmentControlMessage — собрать cmsg для одного sendmsg с UDP_SEGMENT.
+// Вход: oob, segmentSize. Выход: готовый OOB буфер.
+func udpSegmentControlMessage(oob []byte, segmentSize int) []byte {
+	if cap(oob) < unix.CmsgSpace(2) {
+		oob = make([]byte, unix.CmsgSpace(2))
+	} else {
+		oob = oob[:unix.CmsgSpace(2)]
+		clear(oob)
+	}
+	hdr := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
+	hdr.Level = unix.IPPROTO_UDP
+	hdr.Type = unix.UDP_SEGMENT
+	hdr.SetLen(unix.CmsgLen(2))
+	binary.NativeEndian.PutUint16(oob[unix.CmsgLen(0):unix.CmsgLen(0)+2], uint16(segmentSize))
+	return oob
+}
+
+// supportsUDPSegment — проверить, доступен ли UDP_SEGMENT на сокете.
+// Вход: fd. Выход: true если getsockopt не вернул ошибку.
+func supportsUDPSegment(fd int) bool {
+	if fd <= 0 {
+		return false
+	}
+	_, err := unix.GetsockoptInt(fd, unix.IPPROTO_UDP, unix.UDP_SEGMENT)
+	return err == nil
+}
+
+// shouldDisableUDPGSO — ошибки, после которых GSO лучше выключить и откатиться.
+// Вход: err. Выход: true если дальнейшие GSO-send лучше отключить.
+func shouldDisableUDPGSO(err error) bool {
+	return errors.Is(err, syscall.EIO) ||
+		errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.EMSGSIZE) ||
+		errors.Is(err, syscall.ENOPROTOOPT) ||
+		errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, syscall.ENOTSUP)
+}
+
 //
 // =============================== UDP ================================
 //
@@ -668,14 +742,9 @@ func newUDPState(conn *net.UDPConn, rcv, snd int, zerocopy bool, zcMin int, shar
 		}
 	}
 
-	// SO_ZEROCOPY
-	if zerocopy && fd > 0 {
-		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ZEROCOPY, 1); err == nil {
-			u.zerocp = true
-			slog.Debug("zerocopy on")
-		} else {
-			slog.Warn("zerocopy off", "err", err)
-		}
+	if supportsUDPSegment(fd) {
+		u.txGSO.Store(true)
+		slog.Debug("udp gso on")
 	}
 
 	return u, nil
@@ -757,6 +826,20 @@ func (u *udpState) close() {
 		_ = u.pc.Close()
 		_ = u.conn.Close()
 	})
+}
+
+// txGSOEnabled — текущее состояние runtime-поддержки UDP_SEGMENT на сокете.
+// Вход: нет. Выход: true если TX может пытаться коалесцировать sendmsg.
+func (u *udpState) txGSOEnabled() bool {
+	return u.txGSO.Load()
+}
+
+// disableTxGSO — выключить GSO после ошибки пути/ядра и залогировать это один раз.
+// Вход: err. Выход: нет.
+func (u *udpState) disableTxGSO(err error) {
+	if u.txGSO.CompareAndSwap(true, false) {
+		slog.Warn("udp gso off", "err", err)
+	}
 }
 
 // close — закрыть весь UDP bundle.
@@ -930,6 +1013,88 @@ func isTempSendErr(err error) bool {
 	return false
 }
 
+// gsoBatchEnd — найти максимальную допустимую GSO-группу от start.
+// Вход: packets, start. Выход: индекс конца [start:end) для одного sendmsg.
+func gsoBatchEnd(packets []txPacket, start int) int {
+	if start >= len(packets) {
+		return start
+	}
+	const maxUDPSegments = 64
+	segSize := len(packets[start].buf)
+	if segSize <= 0 {
+		return start + 1
+	}
+	endpointKey := packets[start].endpoint.gsoKey
+	end := start + 1
+	for end < len(packets) && end-start < maxUDPSegments {
+		if packets[end].endpoint.gsoKey != endpointKey {
+			break
+		}
+		segLen := len(packets[end].buf)
+		if segLen <= 0 || segLen > segSize {
+			break
+		}
+		end++
+		if segLen < segSize {
+			break
+		}
+	}
+	if end-start < 2 {
+		return start + 1
+	}
+	return end
+}
+
+// writeBatchMessages — отправить обычный UDP batch через WriteBatch.
+// Вход: ctx, udp, msgs. Выход: ошибка отправки или nil.
+func writeBatchMessages(ctx context.Context, udp *udpState, msgs []ipv4.Message) error {
+	for off := 0; off < len(msgs); {
+		n, err := udp.pc.WriteBatch(msgs[off:], 0)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("udp write batch: %w", err)
+		}
+		if n <= 0 {
+			return errors.New("udp write batch wrote 0 messages")
+		}
+		off += n
+	}
+	return nil
+}
+
+// sendGSOBatch — отправить несколько inner-пакетов одним sendmsg с UDP_SEGMENT.
+// Вход: ctx, udp, packets, buffers, oob. Выход: ошибка отправки или nil.
+func sendGSOBatch(ctx context.Context, udp *udpState, packets []txPacket, buffers [][]byte, oob []byte) error {
+	if len(packets) < 2 {
+		return errors.New("udp gso batch requires at least 2 packets")
+	}
+	if len(buffers) < len(packets) {
+		return errors.New("udp gso batch buffers too small")
+	}
+	segSize := len(packets[0].buf)
+	totalBytes := 0
+	for i := range packets {
+		buffers[i] = packets[i].buf
+		totalBytes += len(packets[i].buf)
+	}
+	n, err := unix.SendmsgBuffers(udp.fd, buffers[:len(packets)], udpSegmentControlMessage(oob, segSize), packets[0].endpoint.sock4, 0)
+	if err != nil {
+		if shouldDisableUDPGSO(err) {
+			udp.disableTxGSO(err)
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	if n != totalBytes {
+		return fmt.Errorf("short udp gso send: %d of %d", n, totalBytes)
+	}
+	return nil
+}
+
 // startErrMonitor — дренаж error-queue для логов ICMP.
 // Вход: ctx, tick. Выход: нет.
 func (u *udpState) startErrMonitor(ctx context.Context, tick time.Duration) {
@@ -1020,6 +1185,9 @@ func main() {
 			"udpgso_mss", cfg.Transport.UDPGSOMSS,
 		)
 	}
+	if cfg.Transport.ZeroCopy {
+		slog.Warn("transport.zerocopy ignored", "reason", "runtime path disabled until completion tracking is implemented")
+	}
 
 	pm := newPeerMap()
 	if err := pm.loadFromTOML(cfg.Map.Path); err != nil {
@@ -1084,7 +1252,7 @@ func main() {
 	}
 	udp, err := newUDPBundle(cfg.Transport.Listen, cfg.Transport.Listeners,
 		cfg.Transport.UDPRcv, cfg.Transport.UDPSnd, cfg.Transport.ReusePort,
-		cfg.Transport.ZeroCopy, cfg.Transport.ZCMinBytes)
+		false, cfg.Transport.ZCMinBytes)
 	if err != nil {
 		slog.Error("udp listen", "err", err)
 		os.Exit(1)
@@ -1129,7 +1297,8 @@ func main() {
 		"pkt_limit_tx_worker", perWorkerPktLimitTX,
 		"cfg_mtu", cfg.Tun.MTU, "link_mtu", linkMTU, "eff_mtu", effMTU,
 		"hold", cfg.Batch.Hold, "tx_hold", txMaxHold, "warmup", cfg.Batch.Warmup,
-		"zerocopy", cfg.Transport.ZeroCopy, "zc_min_bytes", cfg.Transport.ZCMinBytes,
+		"udp_gso", udp.primary.txGSOEnabled(),
+		"zerocopy", udp.primary.zerocp,
 		"tun", cfg.Tun.Name, "tun_queues", len(tun.queues),
 	)
 
@@ -1271,26 +1440,55 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 	for i := 0; i < N; i++ {
 		msgs[i].Buffers = make([][]byte, 1)
 	}
+	packets := make([]txPacket, N)
+	gsoBuffers := make([][]byte, N)
+	gsoOOB := make([]byte, unix.CmsgSpace(2))
 
 	k := 0
 	batchStart := time.Now()
 
-	timeoutMS := clamp(int(maxHold/time.Millisecond), 1, 200)
-	pfd := []unix.PollFd{{Fd: int32(tun.fd), Events: unix.POLLIN}}
+	flushPackets := func() error {
+		if k == 0 {
+			batchStart = time.Now()
+			return nil
+		}
+		if !udp.txGSOEnabled() {
+			if err := writeBatchMessages(ctx, udp, msgs[:k]); err != nil {
+				return err
+			}
+			k = 0
+			batchStart = time.Now()
+			return nil
+		}
 
-	flushCopy := func() error {
+		copyStart := 0
 		for off := 0; off < k; {
-			n, err := udp.pc.WriteBatch(msgs[off:k], 0)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil
+			gsoEnd := gsoBatchEnd(packets[:k], off)
+			if gsoEnd-off < 2 {
+				off++
+				continue
+			}
+			if copyStart < off {
+				if err := writeBatchMessages(ctx, udp, msgs[copyStart:off]); err != nil {
+					return err
 				}
-				return fmt.Errorf("udp write batch: %w", err)
 			}
-			if n <= 0 {
-				return errors.New("udp write batch wrote 0 messages")
+			if err := sendGSOBatch(ctx, udp, packets[off:gsoEnd], gsoBuffers, gsoOOB); err != nil {
+				if !udp.txGSOEnabled() || isTempSendErr(err) {
+					if err := writeBatchMessages(ctx, udp, msgs[off:gsoEnd]); err != nil {
+						return err
+					}
+				} else {
+					return fmt.Errorf("udp gso send: %w", err)
+				}
 			}
-			off += n
+			off = gsoEnd
+			copyStart = off
+		}
+		if copyStart < k {
+			if err := writeBatchMessages(ctx, udp, msgs[copyStart:k]); err != nil {
+				return err
+			}
 		}
 		k = 0
 		batchStart = time.Now()
@@ -1298,16 +1496,28 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 	}
 
 	for {
-		_, _ = unix.Poll(pfd, timeoutMS)
+		waitTimeout := time.Duration(-1)
+		if k > 0 {
+			waitTimeout = time.Until(batchStart.Add(maxHold))
+			if waitTimeout < 0 {
+				waitTimeout = 0
+			}
+		}
+		if err := waitFD(int32(tun.fd), unix.POLLIN, waitTimeout); err != nil {
+			if ctx.Err() != nil {
+				return flushPackets()
+			}
+			return fmt.Errorf("tun poll: %w", err)
+		}
 		if ctx.Err() != nil {
-			return flushCopy()
+			return flushPackets()
 		}
 
 		for k < N {
 			n, err := tun.ReadNB(readBufs[k][:linkMTU])
 			if err != nil {
 				if ctx.Err() != nil {
-					return flushCopy()
+					return flushPackets()
 				}
 				return fmt.Errorf("tun read: %w", err)
 			}
@@ -1329,33 +1539,19 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 				continue
 			}
 
-			// zerocopy или копирующий путь
-			useZC := udp.zerocp && len(pkt) >= udp.zcMin
-
-			if useZC {
-				_, err := unix.SendmsgN(udp.fd, pkt, nil, endpoint.sock4, unix.MSG_ZEROCOPY)
-				if err != nil {
-					if isTempSendErr(err) {
-						_, _ = udp.conn.WriteToUDP(pkt, endpoint.udpAddr)
-					} else {
-						udp.notePeerUnavailable(endpoint.key, udp.phase(), "send_error", err)
-					}
-				}
-				continue
-			}
-
 			// Копирующий путь (батч).
 			msgs[k].Buffers[0] = pkt
 			msgs[k].Addr = endpoint.udpAddr
+			packets[k] = txPacket{buf: pkt, endpoint: endpoint}
 			k++
 
 			now := time.Now()
-			if udp.inWarmup(now) || k >= pktLimit || now.Sub(batchStart) > maxHold {
+			if udp.inWarmup(now) || k >= pktLimit || !now.Before(batchStart.Add(maxHold)) {
 				break
 			}
 		}
 
-		if err := flushCopy(); err != nil {
+		if err := flushPackets(); err != nil {
 			return err
 		}
 	}

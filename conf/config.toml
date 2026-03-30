@@ -1,25 +1,31 @@
-# overlay.toml — конфиг для UDP L3-оверлея
+# sample config for a systemd deployment
+# install target:
+#   /etc/l3overlay/config.toml
 
 [tun]
-name       = "tun0"            # имя TUN-интерфейса
-addr       = "10.10.0.2/24"    # IPv4 CIDR адрес на TUN
-#link_mtu   = 9000             # MTU линка интерфейса; 9000 для jumbo
-add_route  = true              # добавить маршрут собственной подсети addr в TUN
-gray_routes = []               # дополнительные подсети, которые идут в TUN (массив CIDR)
-mtu        = 65000             # целевой MTU обработки пакетов в приложении; 9000
+name = "tun0"                  # TUN interface name
+addr = "10.10.0.10/24"         # local overlay IPv4 address
+link_mtu = 9000                # interface MTU on the host
+add_route = true               # add the connected route for addr via TUN
+gray_routes = []               # optional extra routes via TUN
+mtu = 8972                     # safe inner MTU for a 9000-byte UDP underlay
 
 [transport]
-listen   = "0.0.0.0:5555"      # UDP адрес прослушивания (и отправки)
-udp_rbuf = 33554432            # размер RX буфера UDP сокета; 32 MiB
-udp_wbuf = 33554432            # размер TX буфера UDP сокета; 32 MiB
-zerocopy = true
+listen = "0.0.0.0:5555"        # local UDP bind address
+listeners = 1                  # keep a single listener by default
+reuse_port = false             # enable only after targeted verification
+udp_rbuf = 33554432            # requested UDP RX buffer (32 MiB)
+udp_wbuf = 33554432            # requested UDP TX buffer (32 MiB)
 
 [map]
-path = "conf/peers.toml"        # путь к TOML-файлу мэппинга серый_IP → белый endpoint
+path = "/etc/l3overlay/peers.toml"
 
 [batch]
-hold   = "5ms"                  # макс. удержание батча; 5мс для низкой задержки
-warmup = "2s"                   # тёплый старт: в течение 2с флаш каждого пакета
+hold = "25us"                  # current runtime-tuned TX batch hold
+warmup = "2s"                  # flush each packet during warmup
 
 [log]
-level = "info"                 # уровень логов: debug|info|warn|error
+level = "info"                 # debug|info|warn|error
+
+[debug]
+pprof_listen = ""              # empty string disables pprof

@@ -1,0 +1,20 @@
+[Unit]
+Description=3LOver L3 UDP overlay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/l3overlay
+ExecStart=/usr/local/bin/l3overlay -config /etc/l3overlay/config.toml
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_RESOURCE
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
