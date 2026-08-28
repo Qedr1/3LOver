@@ -1,10 +1,10 @@
 [tun]
 name = "tunB"
 addr = "10.10.0.2/24"
-link_mtu = 9000
+link_mtu = 18000
 add_route = true
 gray_routes = []
-mtu = 8972
+mtu = 17972
 
 [transport]
 listen = "172.30.0.2:25555"
